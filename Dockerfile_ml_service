@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+LABEL author=${AUTHOR}
+
+# рабочая директория в контейнере
+WORKDIR /app
+
+# копируем только содержимое ml_service в /app
+COPY ml_service/ .
+
+# установка зависимостей
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# открываем порт
+EXPOSE 8081
+
+# подмонтируем модели
+VOLUME /models
+
+# запускаем uvicorn
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8081"]

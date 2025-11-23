@@ -1,0 +1,14 @@
+artifact_uri: file:///home/mle-user/mle_projects/e_commerce_recsys/mlruns/260036731237827965/bf15128deb4a440e9bfeb47684747f7e/artifacts
+end_time: 1763677505132
+entry_point_name: ''
+experiment_id: '260036731237827965'
+lifecycle_stage: active
+run_id: bf15128deb4a440e9bfeb47684747f7e
+run_name: first_catboost_ranking
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1763677500822
+status: 4
+tags: []
+user_id: mle-user
