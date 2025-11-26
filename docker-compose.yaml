@@ -50,6 +50,8 @@ services:
       - ./src:/opt/airflow/src
       - ./models:/opt/airflow/models
       - ./data:/opt/airflow/data
+      - ./plugins:/opt/airflow/plugin
+      
     env_file:
       - .env
     environment:

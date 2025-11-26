@@ -175,6 +175,11 @@ def prepare_features(train_fit, df_items, item_encoder):
     cat_pop = train_fit.groupby('category_id').size().to_dict()
     parent_pop = train_fit.groupby('parent_id').size().to_dict()
     
+    # Веса
+    item_weight_sum = train_fit.groupby('item_id_enc')['weight'].sum().to_dict()
+    user_weight_sum = train_fit.groupby('user_id_enc')['weight'].sum().to_dict()
+    ui_weight = train_fit.groupby(['user_id_enc', 'item_id_enc'])['weight'].sum().reset_index(name='ui_weight')
+    
     # Топ категории пользователя
     user_cat_counts = train_fit.groupby(['user_id_enc', 'category_id']).size().reset_index(name='count')
     user_top_cat = user_cat_counts.loc[user_cat_counts.groupby('user_id_enc')['count'].idxmax()].set_index('user_id_enc')['category_id'].to_dict()
@@ -187,16 +192,18 @@ def prepare_features(train_fit, df_items, item_encoder):
         'item_to_parent': item_to_parent,
         'item_popularity': item_popularity,
         'user_activity': user_activity,
+        'item_weight_sum': item_weight_sum,
+        'user_weight_sum': user_weight_sum,
         'cat_pop': cat_pop,
         'parent_pop': parent_pop,
         'user_top_cat': user_top_cat,
         'user_top_parent': user_top_parent
     }
     
-    return features_dict
+    return features_dict, ui_weight
 
 
-def prepare_ranking_data(personal_als, train_val, features_dict):
+def prepare_ranking_data(personal_als, train_val, features_dict, ui_weight):
     """Подготовка данных для ранкера"""
     train_for_ranking = personal_als[['user_id_enc', 'item_id_enc', 'score', 'rank']].copy()
     
@@ -204,6 +211,12 @@ def prepare_ranking_data(personal_als, train_val, features_dict):
     train_for_ranking['als_score'] = train_for_ranking['score']
     train_for_ranking['item_popularity'] = train_for_ranking['item_id_enc'].map(features_dict['item_popularity']).fillna(0)
     train_for_ranking['user_activity'] = train_for_ranking['user_id_enc'].map(features_dict['user_activity']).fillna(0)
+    
+    # Вес-фичи
+    train_for_ranking['item_weight_sum'] = train_for_ranking['item_id_enc'].map(features_dict['item_weight_sum']).fillna(0)
+    train_for_ranking['user_weight_sum'] = train_for_ranking['user_id_enc'].map(features_dict['user_weight_sum']).fillna(0)
+    train_for_ranking = train_for_ranking.merge(ui_weight, on=['user_id_enc', 'item_id_enc'], how='left')
+    train_for_ranking['ui_weight'] = train_for_ranking['ui_weight'].fillna(0)
     
     # Категорийные фичи
     train_for_ranking['category_id'] = train_for_ranking['item_id_enc'].map(features_dict['item_to_cat']).fillna(-1).astype(int)
@@ -228,7 +241,19 @@ def prepare_ranking_data(personal_als, train_val, features_dict):
 
 def train_ranker(train_for_ranking):
     """Обучение CatBoost ранкера"""
-    features = ['als_score', 'item_popularity', 'user_activity', 'category_popularity', 'parent_popularity', 'category_match', 'parent_match']
+    features = [
+        'als_score', 
+        'item_popularity', 
+        'user_activity',
+        'item_weight_sum',
+        'user_weight_sum',
+        'ui_weight',
+        'category_popularity', 
+        'parent_popularity', 
+        'category_match', 
+        'parent_match'
+    ]
+    cat_features = ['category_id', 'parent_id', 'user_top_category', 'user_top_parent']
     
     # Балансировка
     positives = train_for_ranking[train_for_ranking['target'] == 1]
@@ -248,21 +273,22 @@ def train_ranker(train_for_ranking):
     )
     
     ranker.fit(
-        train_balanced[features],
+        train_balanced[features + cat_features],
         train_balanced['target'],
-        group_id=train_balanced['user_id_enc']
+        group_id=train_balanced['user_id_enc'],
+        cat_features=cat_features
     )
     
     # Сохранить модель
     ranker.save_model('models/prod_model_catboost_ranker.cbm')
     print("CatBoost модель сохранена")
     
-    return ranker, features
+    return ranker, features, cat_features
 
 
-def generate_final_recommendations(train_for_ranking, ranker, features):
+def generate_final_recommendations(train_for_ranking, ranker, features, cat_features):
     """Генерация финальных рекомендаций"""
-    train_for_ranking['final_score'] = ranker.predict(train_for_ranking[features])
+    train_for_ranking['final_score'] = ranker.predict(train_for_ranking[features + cat_features])
     
     recommendations = train_for_ranking.sort_values(['user_id_enc', 'final_score'], ascending=[True, False])
     recommendations = recommendations.groupby('user_id_enc').head(100).reset_index(drop=True)
@@ -273,7 +299,7 @@ def generate_final_recommendations(train_for_ranking, ranker, features):
     return recommendations
 
 
-def save_to_s3(personal_als, recommendations, features_dict):
+def save_to_s3(personal_als, recommendations, features_dict, ui_weight):
     """Сохранение в S3"""
     # ALS рекомендации
     personal_als.to_parquet(
@@ -292,6 +318,9 @@ def save_to_s3(personal_als, recommendations, features_dict):
     # Фичи
     with open('models/features_dict.pkl', 'wb') as f:
         pickle.dump(features_dict, f)
+    
+    # UI веса
+    ui_weight.to_pickle('models/ui_weight.pkl')
     
     print("Данные сохранены в S3")
 
@@ -319,19 +348,19 @@ def main():
     )
     
     # 6. Подготовка фичей
-    features_dict = prepare_features(train_fit, df_items, item_encoder)
+    features_dict, ui_weight = prepare_features(train_fit, df_items, item_encoder)
     
     # 7. Подготовка данных для ранкера
-    train_for_ranking = prepare_ranking_data(personal_als, train_val, features_dict)
+    train_for_ranking = prepare_ranking_data(personal_als, train_val, features_dict, ui_weight)
     
     # 8. Обучение ранкера
-    ranker, features = train_ranker(train_for_ranking)
+    ranker, features, cat_features = train_ranker(train_for_ranking)
     
     # 9. Генерация финальных рекомендаций
-    recommendations = generate_final_recommendations(train_for_ranking, ranker, features)
+    recommendations = generate_final_recommendations(train_for_ranking, ranker, features, cat_features)
     
     # 10. Сохранение в S3
-    save_to_s3(personal_als, recommendations, features_dict)
+    save_to_s3(personal_als, recommendations, features_dict, ui_weight)
     
     print("=" * 50)
     print("ОБУЧЕНИЕ ЗАВЕРШЕНО")

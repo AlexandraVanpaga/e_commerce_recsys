@@ -171,3 +171,5 @@ data/
 # models
 .pkl
 /models
+
+.dvc/config
