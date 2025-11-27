@@ -29,11 +29,75 @@ storage_options = {
 }
 
 
+def validate_data(df_events, df_items):
+    """Валидация загруженных данных"""
+    print("\nВалидация данных...")
+    
+    # Проверка на пустоту
+    assert not df_events.empty, "❌ df_events пустой!"
+    assert not df_items.empty, "❌ df_items пустой!"
+    
+    # Проверка обязательных колонок
+    required_events_cols = ['timestamp', 'visitor_id', 'event', 'item_id']
+    required_items_cols = ['item_id', 'category_id', 'parent_id']
+    
+    for col in required_events_cols:
+        assert col in df_events.columns, f"❌ Колонка '{col}' отсутствует в events!"
+    
+    for col in required_items_cols:
+        assert col in df_items.columns, f"❌ Колонка '{col}' отсутствует в items!"
+    
+    # Проверка типов событий
+    valid_events = {'view', 'addtocart', 'transaction'}
+    actual_events = set(df_events['event'].unique())
+    assert actual_events.issubset(valid_events), f"❌ Неизвестные события: {actual_events - valid_events}"
+    
+    # Проверка на пропуски
+    assert df_events['visitor_id'].notna().all(), "❌ Пропуски в visitor_id!"
+    assert df_events['item_id'].notna().all(), "❌ Пропуски в item_id!"
+    assert df_events['timestamp'].notna().all(), "❌ Пропуски в timestamp!"
+    
+    # Проверка диапазонов
+    assert df_events['visitor_id'].min() > 0, "❌ visitor_id должны быть положительными!"
+    assert df_events['item_id'].min() > 0, "❌ item_id должны быть положительными!"
+    
+    # Статистика
+    print(f"✓ События: {len(df_events):,} строк")
+    print(f"✓ Товары: {len(df_items):,} строк")
+    print(f"✓ Уникальных пользователей: {df_events['visitor_id'].nunique():,}")
+    print(f"✓ Уникальных товаров: {df_events['item_id'].nunique():,}")
+    print(f"✓ Распределение событий:")
+    for event, count in df_events['event'].value_counts().items():
+        print(f"  - {event}: {count:,} ({count/len(df_events)*100:.1f}%)")
+    
+    # Проверка дат
+    df_events['datetime'] = pd.to_datetime(df_events['timestamp'])
+    date_range = df_events['datetime'].max() - df_events['datetime'].min()
+    print(f"✓ Период данных: {df_events['datetime'].min().date()} - {df_events['datetime'].max().date()} ({date_range.days} дней)")
+    
+    # Предупреждения
+    if df_events['visitor_id'].nunique() < 1000:
+        print("⚠️ WARNING: Мало уникальных пользователей (<1000)")
+    
+    if df_events['item_id'].nunique() < 100:
+        print("⚠️ WARNING: Мало уникальных товаров (<100)")
+    
+    transactions = df_events[df_events['event'] == 'transaction']
+    if len(transactions) / len(df_events) < 0.001:
+        print(f"⚠️ WARNING: Очень мало покупок ({len(transactions)/len(df_events)*100:.2f}%)")
+    
+    print("✓ Валидация пройдена!\n")
+
+
 def load_data():
     """Загрузка данных"""
     print("Загрузка данных...")
     df_events = pd.read_csv('data/processed/events.csv')
     df_items = pd.read_csv('data/processed/item_properties.csv')
+    
+    # Валидация
+    validate_data(df_events, df_items)
+    
     df_events['datetime'] = pd.to_datetime(df_events['timestamp'])
     print(f"Events: {len(df_events):,}, Items: {len(df_items):,}")
     return df_events, df_items
@@ -48,9 +112,17 @@ def split_data(df_events):
     train_val = df_events[(df_events['datetime'] >= train_end) & (df_events['datetime'] < retrain_end)].copy()
     new_events = df_events[df_events['datetime'] >= retrain_end].copy()
     
-    print(f"Train fit: {len(train_fit):,} (до {train_end})")
-    print(f"Train val: {len(train_val):,} ({train_end} - {retrain_end})")
-    print(f"New events: {len(new_events):,} (с {retrain_end})")
+    # Валидация разбиения
+    assert len(train_fit) > 0, "❌ Train set пустой!"
+    assert len(train_val) > 0, "❌ Val set пустой!"
+    assert len(new_events) > 0, "❌ Test set пустой!"
+    
+    total = len(train_fit) + len(train_val) + len(new_events)
+    assert total == len(df_events), "❌ Потеря данных при разбиении!"
+    
+    print(f"Train fit: {len(train_fit):,} (до {train_end}) - {len(train_fit)/total*100:.1f}%")
+    print(f"Train val: {len(train_val):,} ({train_end} - {retrain_end}) - {len(train_val)/total*100:.1f}%")
+    print(f"New events: {len(new_events):,} (с {retrain_end}) - {len(new_events)/total*100:.1f}%")
     
     return train_fit, train_val, new_events
 
@@ -85,10 +157,16 @@ def train_als(train_fit, user_encoder, item_encoder):
     """Обучение ALS модели"""
     train_fit['weight'] = train_fit['event'].map({'view': 1, 'addtocart': 5, 'transaction': 10})
     
+    # Валидация весов
+    assert train_fit['weight'].notna().all(), "❌ Неизвестные типы событий!"
+    
     user_item_matrix = csr_matrix(
         (train_fit['weight'], (train_fit['user_id_enc'], train_fit['item_id_enc'])),
         shape=(len(user_encoder.classes_), len(item_encoder.classes_))
     )
+    
+    # Валидация матрицы
+    assert user_item_matrix.nnz > 0, "❌ Матрица взаимодействий пустая!"
     
     print(f"Матрица: {user_item_matrix.shape}")
     print(f"Заполненность: {user_item_matrix.nnz / (user_item_matrix.shape[0] * user_item_matrix.shape[1]) * 100:.4f}%")
@@ -121,9 +199,14 @@ def generate_als_recommendations(model, user_item_matrix, train_fit, train_val, 
     max_user_id = model.user_factors.shape[0]
     target_users = [u for u in target_users if u < max_user_id]
     
+    # Валидация
+    assert len(target_users) > 0, "❌ Нет целевых пользователей для рекомендаций!"
+    
     print(f"Пользователей для рекомендаций: {len(target_users):,}")
     
     personal_recs = []
+    errors = 0
+    
     for user_id in tqdm(target_users, desc="ALS Recommendations"):
         try:
             item_ids, scores = model.recommend(
@@ -142,13 +225,20 @@ def generate_als_recommendations(model, user_item_matrix, train_fit, train_val, 
                         'rank': rank
                     })
         except Exception:
+            errors += 1
             continue
+    
+    # Валидация результата
+    assert len(personal_recs) > 0, "❌ Не удалось сгенерировать рекомендации!"
     
     personal_als = pd.DataFrame(personal_recs)
     personal_als['visitor_id'] = user_encoder.inverse_transform(personal_als['user_id_enc'])
     personal_als['item_id'] = item_encoder.inverse_transform(personal_als['item_id_enc'])
     
     print(f"ALS рекомендации: {len(personal_als):,}")
+    print(f"Пользователей: {personal_als['user_id_enc'].nunique():,}")
+    if errors > 0:
+        print(f"⚠️ Ошибок при генерации: {errors}")
     
     return personal_als
 
@@ -268,6 +358,7 @@ def train_ranker(train_for_ranking):
         iterations=200,
         depth=6,
         learning_rate=0.1,
+        l2_leaf_reg=3.0,
         random_seed=RANDOM_SEED,
         verbose=20
     )

@@ -209,7 +209,7 @@ e_commerce_recsys/
 
 ---
 
-## 🛠 Технологии
+## Технологии
 
 - **ML:** `implicit` (ALS), `CatBoost` (ранжирование), `scikit-learn`
 - **Data:** `pandas`, `numpy`, `scipy`

@@ -1,3 +1,5 @@
+# src/api.py
+
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -35,6 +37,9 @@ ERRORS_COUNT = Counter('recommendations_errors_total', 'Total errors', ['error_t
 MODEL_LOAD_TIME = Gauge('model_load_time_seconds', 'Model load time')
 DATA_SIZE = Gauge('data_size_rows', 'Data size', ['data_type'])
 USERS_SERVED = Counter('users_served_total', 'Total unique users served')
+CACHE_HITS = Counter('recommendations_cache_hits_total', 'Cache hits')
+CACHE_MISSES = Counter('recommendations_cache_misses_total', 'Cache misses')
+CACHE_SIZE = Gauge('recommendations_cache_size', 'Cache size')
 
 
 class UserRequest(BaseModel):
@@ -48,6 +53,10 @@ class RecommendationService:
         self.als_recommendations = None
         self.top_popular = None
         self.served_users = set()
+        # Кэш для рекомендаций
+        self._cache = {}
+        self._cache_ttl = {}  # Time to live
+        self.cache_duration = 3600  # 1 час
 
     def load(self):
         start_time = time.time()
@@ -75,7 +84,28 @@ class RecommendationService:
         MODEL_LOAD_TIME.set(load_time)
         logger.info(f"Models loaded in {load_time:.2f}s")
 
+    def _get_cache_key(self, user_id: int, k: int) -> str:
+        """Генерация ключа для кэша"""
+        return f"user_{user_id}_k_{k}"
+
+    def _is_cache_valid(self, cache_key: str) -> bool:
+        """Проверка валидности кэша"""
+        if cache_key not in self._cache_ttl:
+            return False
+        return time.time() - self._cache_ttl[cache_key] < self.cache_duration
+
     def get_recommendations(self, user_id: int, k: int = 10):
+        # Проверяем кэш
+        cache_key = self._get_cache_key(user_id, k)
+        
+        if cache_key in self._cache and self._is_cache_valid(cache_key):
+            REQUEST_COUNT.labels(type="cached").inc()
+            CACHE_HITS.inc()
+            logger.debug(f"Cache HIT for user_id={user_id}")
+            return self._cache[cache_key]
+        
+        CACHE_MISSES.inc()
+        
         # Трекаем уникальных пользователей
         if user_id not in self.served_users:
             self.served_users.add(user_id)
@@ -92,8 +122,29 @@ class RecommendationService:
             REQUEST_COUNT.labels(type="personal").inc()
             recs = user_candidates.nlargest(k, 'score')['item_id_enc'].tolist()
         
+        # Сохраняем в кэш
+        self._cache[cache_key] = recs
+        self._cache_ttl[cache_key] = time.time()
+        CACHE_SIZE.set(len(self._cache))
+        logger.debug(f"Cache MISS for user_id={user_id}, cached result")
+        
         RECOMMENDATIONS_RETURNED.observe(len(recs))
         return recs
+
+    def clear_expired_cache(self):
+        """Очистка устаревшего кэша"""
+        current_time = time.time()
+        expired_keys = [
+            key for key, timestamp in self._cache_ttl.items()
+            if current_time - timestamp > self.cache_duration
+        ]
+        for key in expired_keys:
+            del self._cache[key]
+            del self._cache_ttl[key]
+        
+        if expired_keys:
+            CACHE_SIZE.set(len(self._cache))
+            logger.info(f"Cleared {len(expired_keys)} expired cache entries")
 
 
 rec_service = RecommendationService()
@@ -130,3 +181,24 @@ async def recommendations(req: UserRequest):
         logger.error(f"Error user_id={req.user_id}: {e}")
         ERRORS_COUNT.labels(error_type="recommendation_error").inc()
         return {"user_id": req.user_id, "recommendations": rec_service.top_popular['item_id_enc'].head(req.k).tolist()}
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Очистка устаревшего кэша (для админов)"""
+    rec_service.clear_expired_cache()
+    return {
+        "status": "ok", 
+        "cache_size": len(rec_service._cache),
+        "message": "Expired cache entries cleared"
+    }
+
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Статистика кэша"""
+    return {
+        "cache_size": len(rec_service._cache),
+        "cache_duration_seconds": rec_service.cache_duration,
+        "unique_users_served": len(rec_service.served_users)
+    }

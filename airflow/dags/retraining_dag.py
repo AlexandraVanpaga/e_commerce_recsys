@@ -1,9 +1,13 @@
+# airflow/dags/recsys_retrain.py
+
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 from telegram_plugin import send_telegram_success_message, send_telegram_failure_message
+import logging
 
+logger = logging.getLogger(__name__)
 
 default_args = {
     'owner': 'recsys',
@@ -25,6 +29,19 @@ dag = DAG(
 
 DATA_PATH = '/opt/airflow/data/processed'
 MODELS_PATH = '/opt/airflow/models'
+
+# Конфигурация ALS модели (подобрано экспериментально)
+ALS_FACTORS = 64           # Размерность латентных векторов
+ALS_ITERATIONS = 15        # Количество итераций обучения
+ALS_REGULARIZATION = 0.01  # L2 регуляризация
+ALS_RANDOM_SEED = 42       # Для воспроизводимости
+
+# Конфигурация CatBoost
+CATBOOST_ITERATIONS = 200
+CATBOOST_DEPTH = 6
+CATBOOST_LEARNING_RATE = 0.1
+CATBOOST_L2_LEAF_REG = 3.0
+CATBOOST_RANDOM_SEED = 42
 
 
 def retrain_als():
@@ -67,11 +84,18 @@ def retrain_als():
     train_fit['item_id_enc'] = item_encoder.transform(train_fit['item_id'])
     train_fit['weight'] = train_fit['event'].map({'view': 1, 'addtocart': 5, 'transaction': 10})
     
+    # Валидация весов
+    if train_fit['weight'].isna().any():
+        raise ValueError("❌ Обнаружены неизвестные типы событий!")
+    
     # Матрица из train
     user_item_matrix = csr_matrix(
         (train_fit['weight'], (train_fit['user_id_enc'], train_fit['item_id_enc'])),
         shape=(len(user_encoder.classes_), len(item_encoder.classes_))
     )
+    
+    if user_item_matrix.nnz == 0:
+        raise ValueError("❌ Матрица взаимодействий пустая!")
     
     sparsity = 100 * (1 - user_item_matrix.nnz / (user_item_matrix.shape[0] * user_item_matrix.shape[1]))
     print(f"\nМатрица взаимодействий:")
@@ -81,7 +105,13 @@ def retrain_als():
     
     # ALS на train
     print(f"\nОбучение ALS...")
-    model = AlternatingLeastSquares(factors=64, iterations=15, regularization=0.01, random_state=42, use_gpu=False)
+    model = AlternatingLeastSquares(
+        factors=ALS_FACTORS,
+        iterations=ALS_ITERATIONS,
+        regularization=ALS_REGULARIZATION,
+        random_state=ALS_RANDOM_SEED,
+        use_gpu=False
+    )
     model.fit(user_item_matrix.astype('float32'))
     
     # Сохранение
@@ -98,7 +128,7 @@ def retrain_als():
     train_fit.to_pickle(f'{MODELS_PATH}/train_fit.pkl')
     test_data.to_pickle(f'{MODELS_PATH}/test_data.pkl')
     
-    print(f"ALS обучена и сохранена")
+    print(f"✓ ALS обучена и сохранена")
 
 
 def prepare_features():
@@ -168,7 +198,7 @@ def prepare_features():
     print(f"  Суммы весов товаров: {len(item_weight_sum):,}")
     print(f"  Активности пользователей: {len(user_activity):,}")
     print(f"  Суммы весов пользователей: {len(user_weight_sum):,}")
-    print(f"Фичи подготовлены")
+    print(f"✓ Фичи подготовлены")
 
 
 def generate_recommendations():
@@ -211,27 +241,106 @@ def generate_recommendations():
     target_users = target_users[:10000]
     print(f"  Используем: {len(target_users):,}")
     
+    # ВАЛИДАЦИЯ ГРАНИЦ
     max_user_id = model.user_factors.shape[0]
+    max_item_id = len(item_encoder.classes_)
+    
     target_users = [u for u in target_users if u < max_user_id]
     
+    print(f"\nГраницы валидации:")
+    print(f"  Макс user_id: {max_user_id - 1}")
+    print(f"  Макс item_id: {max_item_id - 1}")
     print(f"\nГенерация рекомендаций...")
     
     personal_recs = []
+    errors = {
+        'out_of_bounds': 0,
+        'empty_history': 0,
+        'recommendation_failed': 0,
+        'other': 0
+    }
+    
     for user_id in tqdm(target_users, desc="Recommendations"):
         try:
-            item_ids, scores = model.recommend(user_id, user_item_matrix[user_id], N=200, filter_already_liked_items=True)
+            # Проверка истории
+            if user_item_matrix[user_id].nnz == 0:
+                errors['empty_history'] += 1
+                continue
+            
+            item_ids, scores = model.recommend(
+                user_id, 
+                user_item_matrix[user_id], 
+                N=200, 
+                filter_already_liked_items=True
+            )
+            
             for rank, (item_id, score) in enumerate(zip(item_ids, scores), 1):
-                if item_id < len(item_encoder.classes_):
-                    personal_recs.append({
-                        'user_id_enc': user_id,
-                        'item_id_enc': item_id,
-                        'score': float(score),
-                        'rank': rank
-                    })
-        except:
-            continue
+                # СТРОГАЯ ПРОВЕРКА ГРАНИЦ
+                if not (0 <= item_id < max_item_id):
+                    errors['out_of_bounds'] += 1
+                    continue
+                
+                personal_recs.append({
+                    'user_id_enc': user_id,
+                    'item_id_enc': int(item_id),
+                    'score': float(score),
+                    'rank': rank
+                })
+        
+        except IndexError as e:
+            errors['out_of_bounds'] += 1
+            logger.warning(f"IndexError для user_id={user_id}: {e}")
+            
+        except ValueError as e:
+            errors['recommendation_failed'] += 1
+            logger.warning(f"ValueError для user_id={user_id}: {e}")
+            
+        except TypeError as e:
+            errors['recommendation_failed'] += 1
+            logger.warning(f"TypeError для user_id={user_id}: {e}")
+            
+        except Exception as e:
+            errors['other'] += 1
+            logger.error(f"Непредвиденная ошибка для user_id={user_id}: {type(e).__name__}: {e}")
+    
+    # ОТЧЁТ ОБ ОШИБКАХ
+    print(f"\n{'='*50}")
+    print("СТАТИСТИКА ОШИБОК")
+    print(f"{'='*50}")
+    for error_type, count in errors.items():
+        if count > 0:
+            print(f"  {error_type}: {count:,}")
+    
+    total_errors = sum(errors.values())
+    if len(target_users) > 0:
+        success_rate = (len(target_users) - total_errors) / len(target_users) * 100
+        print(f"\nУспешность: {success_rate:.1f}%")
+        
+        if total_errors / len(target_users) > 0.1:
+            logger.warning(f"⚠️ Высокий процент ошибок: {total_errors/len(target_users)*100:.1f}%")
+    
+    # ВАЛИДАЦИЯ РЕЗУЛЬТАТА
+    if len(personal_recs) == 0:
+        raise ValueError("❌ Не удалось сгенерировать рекомендации!")
     
     personal_als = pd.DataFrame(personal_recs)
+    
+    # ФИНАЛЬНАЯ ПРОВЕРКА ПЕРЕД INVERSE_TRANSFORM
+    invalid_items = personal_als[
+        (personal_als['item_id_enc'] < 0) | 
+        (personal_als['item_id_enc'] >= max_item_id)
+    ]
+    
+    if len(invalid_items) > 0:
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {len(invalid_items)} невалидных item_id")
+        logger.error(f"Примеры: {invalid_items.head()}")
+        # Удаляем невалидные
+        personal_als = personal_als[
+            (personal_als['item_id_enc'] >= 0) & 
+            (personal_als['item_id_enc'] < max_item_id)
+        ]
+    
+    # Теперь безопасно делать inverse_transform
     personal_als['visitor_id'] = user_encoder.inverse_transform(personal_als['user_id_enc'])
     personal_als['item_id'] = item_encoder.inverse_transform(personal_als['item_id_enc'])
     
@@ -251,9 +360,13 @@ def generate_recommendations():
         'client_kwargs': {'endpoint_url': endpoint_url}
     }
     
-    personal_als.to_parquet(f's3://{bucket_name}/recsys/recommendations/personal_als.parquet', index=False, storage_options=storage_options)
+    personal_als.to_parquet(
+        f's3://{bucket_name}/recsys/recommendations/personal_als.parquet', 
+        index=False, 
+        storage_options=storage_options
+    )
     
-    print(f"Рекомендации сохранены в S3")
+    print(f"✓ Рекомендации сохранены в S3")
 
 
 def train_ranker():
@@ -332,7 +445,7 @@ def train_ranker():
     
     # Fallback
     if train_for_ranking['target'].sum() == 0:
-        print("\nWARNING: Нет позитивных примеров. Создаём синтетические...")
+        logger.warning("⚠️ Нет позитивных примеров. Создаём синтетические...")
         threshold = train_for_ranking['als_score'].quantile(0.9)
         train_for_ranking['target'] = (train_for_ranking['als_score'] >= threshold).astype(int)
         print(f"Синтетических позитивных: {train_for_ranking['target'].sum():,}")
@@ -354,7 +467,7 @@ def train_ranker():
     # Балансировка
     positives = train_for_ranking[train_for_ranking['target'] == 1]
     negatives = train_for_ranking[train_for_ranking['target'] == 0]
-    negatives_sampled = negatives.sample(n=min(len(positives) * 20, len(negatives)), random_state=42)
+    negatives_sampled = negatives.sample(n=min(len(positives) * 20, len(negatives)), random_state=CATBOOST_RANDOM_SEED)
     
     train_balanced = pd.concat([positives, negatives_sampled]).sort_values('user_id_enc').reset_index(drop=True)
     
@@ -364,7 +477,14 @@ def train_ranker():
     
     # Обучение
     print(f"\nОбучение CatBoost...")
-    ranker = CatBoostRanker(iterations=200, depth=6, learning_rate=0.1, random_seed=42, verbose=False)
+    ranker = CatBoostRanker(
+        iterations=CATBOOST_ITERATIONS,
+        depth=CATBOOST_DEPTH,
+        learning_rate=CATBOOST_LEARNING_RATE,
+        l2_leaf_reg=CATBOOST_L2_LEAF_REG,
+        random_seed=CATBOOST_RANDOM_SEED,
+        verbose=False
+    )
     ranker.fit(
         train_balanced[features + cat_features], 
         train_balanced['target'], 
@@ -418,11 +538,11 @@ def train_ranker():
     recall_10 = np.mean([
         len(set(ranked_user_recs.get(user_id, [])[:10]) & set(actual)) / min(len(actual), 10)
         for user_id, actual in test_user_items.items() if user_id in ranked_user_recs
-    ])
+    ]) if test_user_items else 0
     
     print(f"\n{'=' * 50}")
     if recall_10 < 0.01:
-        print("WARNING: Низкое качество модели (Recall@10 < 1%)")
+        logger.warning("WARNING: Низкое качество модели (Recall@10 < 1%)")
     elif recall_10 < 0.05:
         print(f"Модель работает удовлетворительно (Recall@10: {recall_10*100:.2f}%)")
     else:
@@ -436,7 +556,7 @@ def train_ranker():
         storage_options=storage_options
     )
     
-    print(f"\nФинальные рекомендации сохранены в S3")
+    print(f"\n✓ Финальные рекомендации сохранены в S3")
     print(f"  Всего рекомендаций: {len(recommendations):,}")
     print(f"  Пользователей: {recommendations['user_id_enc'].nunique():,}")
 
