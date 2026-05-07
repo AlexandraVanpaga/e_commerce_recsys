@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel
-from catboost import CatBoostRanker
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 import os
@@ -62,10 +61,6 @@ class RecommendationService:
         start_time = time.time()
         logger.info("Loading models...")
         
-        self.ranker = CatBoostRanker()
-        self.ranker.load_model("/models/prod_model_catboost_ranker.cbm")
-        logger.info("CatBoost loaded")
-        
         self.als_recommendations = pd.read_parquet(
             f"s3://{bucket_name}/recsys/recommendations/final_recommendations.parquet",
             storage_options=storage_options
@@ -120,7 +115,7 @@ class RecommendationService:
             recs = self.top_popular['item_id_enc'].head(k).tolist()
         else:
             REQUEST_COUNT.labels(type="personal").inc()
-            recs = user_candidates.nlargest(k, 'score')['item_id_enc'].tolist()
+            recs = user_candidates.nlargest(k, 'final_score')['item_id_enc'].tolist()
         
         # Сохраняем в кэш
         self._cache[cache_key] = recs
