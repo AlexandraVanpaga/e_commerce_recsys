@@ -67,7 +67,7 @@ class RecommendationService:
         logger.info("CatBoost loaded")
         
         self.als_recommendations = pd.read_parquet(
-            f"s3://{bucket_name}/recsys/recommendations/personal_als.parquet",
+            f"s3://{bucket_name}/recsys/recommendations/final_recommendations.parquet",
             storage_options=storage_options
         )
         DATA_SIZE.labels(data_type="als_recommendations").set(len(self.als_recommendations))
